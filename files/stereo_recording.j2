@@ -1,0 +1,1781 @@
+<?php
+
+# Autore: Alessandro Rovetto
+#
+# versione: 2.4 --> Bug 6597 - Normalization of audio channel order 
+# versione: 2.3 --> Fixed bug 6451
+# versione: 2.2 --> Fixed incompatibility with php 5.3
+# versione: 2.1 --> Bug 6413 - Tag incompleti in caso di consultationCall
+# 
+
+
+$pathlog='/var/log/stereo_recording';
+date_default_timezone_set("Europe/Rome");
+
+$expire=60*60*4; /* 4 hours */
+$mypid = getmypid();
+
+$segmentsCached= array(); #local cache for segments variable
+
+function doLog($level, $text) {
+        global $pathlog,$config,$mypid;
+	# levels
+	# FATAL,ERROR,WARNING,INFO,DEBUG
+	
+	$levels = array( "FATAL","ERROR","WARNING","INFO","DEBUG" );
+
+	$loglevel=@$config->loglevel;
+
+
+	if (  array_search($level,$levels) > array_search( @$config->loglevel ,$levels) ) {
+		# Do not log higher level than config level
+		return;
+	}
+		
+	$file = basename($_SERVER['PHP_SELF'],".php");
+	$file = "$pathlog/$file" . ".log";
+	$ts = date('Y-m-d H:i:s',time());
+    try {
+    	file_put_contents($file, "$ts [" . $mypid . "] - $level - $text\n",FILE_APPEND );
+	} catch (Exception $e) {
+    	//Do Nothing
+	}
+}
+
+
+function getLastElement($arr) {
+    if ($arr && is_array($arr)) {
+        end($arr); // move the internal pointer to the end of the array
+        $id= key($arr); // fetches the key of the element pointed to by the internal pointer
+        return $arr[$id];
+    } else {
+        return null;
+    }
+}
+
+function getConfig($force = false) {
+	
+	global $memcache;
+	$cfg = $memcache->get("recorder:config");
+	if ($cfg === false || $force) {
+	        $file = basename($_SERVER['PHP_SELF'],".php");
+		$configTxt = file_get_contents($file.".cfg");
+		$cfg=json_decode($configTxt);
+		$memcache->set("recorder:config",$cfg,0,60); #1 min cache
+		doLog("DEBUG","Config is " . print_r($cfg,true));
+	}
+	return $cfg;
+}
+
+function asciiToTxt($data) {
+	$txt="";
+	while (is_string($data) && strlen($data)>0) {
+		$txt = $txt . chr(hexdec(substr($data,0,2)));
+		$data = substr($data,2);
+		#doLog(chr(hexdec(substr($data,0,2))));	
+	}
+	return $txt;
+}
+
+function extractCallDataArr($cdSeq) {
+
+	$retArr = array();
+	$calldataSeq=array();
+	doLog("DEBUG","extractCallDataArr: " . print_r($cdSeq,true));
+
+	if (!is_array($cdSeq)) {
+		doLog("DEBUG","extractCallDataArr: Is OBJ");
+		array_push($calldataSeq,$cdSeq);
+		doLog("DEBUG","OBJ: " . print_r($calldataSeq,true));
+	} else { 
+		doLog("DEBUG","extractCallDataArr: Is Array");
+		$calldataSeq=$cdSeq;
+	}
+	doLog("DEBUG","extractCallDataArr: calldataSeq " . print_r( $calldataSeq ,true));
+
+	foreach( $calldataSeq as $c ) {
+		doLog("DEBUG","CallData: " . print_r($c,true));
+		if (isset($c->name) && isset($c->value)) {
+			$retArr[$c->name]=asciiToTxt($c->value);
+			doLog("DEBUG","Added calldata " . $c->name . "[" . $retArr[$c->name].  " ] " );
+		}
+	}
+	return $retArr;
+
+}
+
+function getRemote($call) {
+	$type=$call->type;
+	doLog("DEBUG","Type is $type");
+	$ani="";
+	$dnis="";
+
+	if(isset($call->ani)) {
+		$ani=$call->ani;
+	}
+	if (isset($call->dnis)) {
+		$dnis=$call->dnis;
+	}
+
+	if ($type == 'inbound') {
+		return $ani;
+	} else {
+		return $dnis;
+	}
+}
+
+function addCallDataTag($tags,$calldataArr,$configmap,$configmap_fb_obj,$override = true ) {
+	doLog("DEBUG","addCallDataTags: received calldata: " . print_r($calldataArr,true));
+	$configmap_fb = (array) $configmap_fb_obj;
+	foreach($configmap as $t => $calldataname ) {
+		if (isset($calldataArr[$calldataname])){
+			$value=$calldataArr[$calldataname];
+			doLog("DEBUG","addCallDataTags: add $calldataname: $value");
+			if ($override || !isset($tags[$t])) {
+				$tags[$t] = $value;
+			} else {
+				doLog("DEBUG","addCallDataTag: do not add new calldata $calldataname:$value because a tag already exists $t -> " .  $tags[$t] );
+			}
+		} else if (isset($configmap_fb) && isset($configmap_fb[$t]) &&  isset($calldataArr[$configmap_fb[$t]])) {
+			$value=$calldataArr[$configmap_fb[$t]];
+			doLog("DEBUG","addCallDataTags: add $calldataname: $value");
+			 if ($override || !isset($tags[$t])) {
+			 	$tags[$t] = $value;
+			} else {
+				doLog("DEBUG","addCallDataTag: do not add new calldata $calldataname:$value because a tag already exists $t -> " .  $tags[$t] );
+			}
+		}
+	}
+	doLog("DEBUG","addCallDataTag: new tags are: ". print_r($tags,true));
+	return $tags;
+} 
+
+function makeTagFile($callid,$id = false,$duplicated = false) {
+	global $memcache;
+	$s=getSegments($callid);
+	if (!$s) {
+		doLog("ERROR","Not found segments for $callid");
+		return;	
+	}
+	$resID=$s['resID'];
+	doLog("DEBUG","makeTagFile callid:$callid - resID:$resID - id:$id - duplicated:$duplicated");
+
+	#Changed to fetch calldata from the last slots in order to handle different calldata for each slots (extralista)
+	$cd=getTags(false,$callid,$id,$duplicated);
+
+	doLog("DEBUG","makeTagFile calldata is: " . print_r($cd,true));
+	$metaInfo=getMetaInfo($callid);
+	if (!isset($cd['X-REC_REMOTE'])) {
+		$dnis=$memcache->get("recorder:dnis:$callid");
+		if ($dnis) {
+			$cd['X-REC_REMOTE'] = $dnis;
+			doLog("DEBUG","makeTagFile use dnis from SIP message for REMOTE number ($dnis)");
+		}
+	}
+	if (!isset($cd['X-REC_VUUID']) || !$cd['X-REC_VUUID']) {
+		$uuid=$s[getStrSlot($duplicated)][$id]['taguuid'];
+		$cd['X-REC_VUUID'] = $uuid;
+		doLog("DEBUG","makeTagFile set X-REC_VUUID to $uuid");
+	}
+
+	doLog("DEBUG","makeTagFile metaInfo is: " . print_r($metaInfo,true));
+	$result="";
+
+	$outputTags = array_merge($metaInfo,$cd);
+
+	if ( $outputTags !== false ) {
+		foreach($outputTags as $n => $v) {
+			
+			if ($n === "Call-ID" && $id !== false) {
+				$v .= "_" . ($duplicated?1:0) ."_" . $id;
+			}
+
+			#Boolean variable are printed using true/false string value
+			if (is_bool($v)) {
+				$vStr = var_export($v,true);
+			} else {
+				$vStr = $v;
+			}
+
+			$result .= "$n: $vStr\n";
+			
+		}
+	}
+
+
+	$segments=makeSegmentsTag($callid,$duplicated);
+	$result .= "Segments: $segments\n";
+
+	doLog("INFO","makeTagFile: callid[$callid] - [$id] - tagfile is:$result");
+	return $result;
+} 
+
+function makeTagFileById($callid,$idSegment,$duplicated) {
+	$output = makeTagFile($callid,$idSegment,$duplicated);
+
+	$segments=getSegments($callid);
+	$slot=$segments[getStrSlot($duplicated)][$idSegment];
+	if ($slot === false) {
+		doLog("DEBUG","ERROR - $isSegment not found " . print_r($segments,true));
+		return;
+	}
+	$startTS = $segments['startTS'] + $slot['start'];
+	$startStr=date('Y-m-d H:i:s',$startTS);
+	$output .= "Start: $startStr\n";
+	if (array_key_exists('marked',$slot)) {
+		$markStr = $slot['marked'] ? 'true' : 'false';
+		$output .= "Marked: $markStr\n";
+	}
+	
+	$uuid=getUUID($callid);
+	$cd=getTags($uuid,$callid,false,$duplicated);
+	if (isset($cd['X-REC_PK_CAMPAIGN'])) {
+		$tpc=$cd['X-REC_PK_CAMPAIGN'];
+		$key=strtolower("$uuid:$tpc");
+		saveTagInfoMem($key,$output);
+	}
+	if (isset($cd['TPC'])) {
+		$tpc=$cd['TPC'];
+		$key=strtolower("$uuid:$tpc");
+		saveTagInfoMem($key,$output . "id=$callid_$idSegment\n");
+	}
+
+	return $output;
+}
+
+function saveTagInfoMem($key,$value) {
+	global $memcache;
+	$prevValue=$memcache->get("recorder:taginfomem:$key");
+	$valueArr=array();
+	if (is_array($prevValue)) {
+		array_push($prevValue,$value);
+	} else {
+		$prevValue=array($value);
+	}
+	
+	$memcache->set("recorder:taginfomem:$key",$prevValue,0,3600*24*7);
+}
+
+function setLinkUUID_CALLID($callid,$uuid) {
+	global $memcache, $expire;
+	$memcache->set("recorder:uuid:$callid",$uuid,0,$expire);
+	lockMemCache();
+	$memcache->set("recorder:callid:$uuid",$callid,0,$expire);
+	unlockMemCache();
+	doLog("DEBUG","Set callid:$callid, uuid:$uuid");
+}
+
+function getUUID($callid) {
+	global $memcache;
+	return $memcache->get("recorder:uuid:$callid");
+}
+function getCallID($uuid,$resID = false) {
+	if ($resID) {
+		$sipkey = getSipKey($uuid,$resID);
+		if ($sipkey) {
+			return $sipkey['callid'];
+		} else {
+			$currentUUID=getUUIDByResID($resID);
+			$sipkey= getSipKey($currentUUID,$resID);
+			if($sipkey && $sipkey['callid']) {
+				$callid = $sipkey['callid'];
+				doLog("DEBUG","getCallID: Return $callid using currentUUID $currentUUID for resID $resID");
+				doLog("DEBUG","getCallID: Set $uuid:$resID -- " . print_r($sipkey,true));
+				setSipKey($uuid,$resID,$sipkey);	
+				return $callid;
+			} 
+		}
+	}
+	global $memcache;
+	return $memcache->get("recorder:callid:$uuid");
+}
+function getSipKey($uuid,$resID) {
+	global $memcache;
+	$varArr=split('@',$resID);
+	$extension=$varArr[0];
+	$sipkey = $memcache->get("recorder:sipkey:$uuid:$extension");
+	if ($sipkey) {
+		$varArr=split(';',$sipkey);
+		$callid = $varArr[0];
+		$ret = array();
+		$ret['callid']=$callid;
+		$ret['sipkey']=$sipkey;
+		return $ret;
+	} else {
+		return false;
+	}
+}
+
+function setSipKey($uuid,$resID,$sipkey) {
+	global $memcache, $expire;
+	$varArr=split('@',$resID);
+	$extension=$varArr[0];
+	$memcache->set("recorder:sipkey:$uuid:$extension",$sipkey['sipkey'],0,$expire);
+}
+
+function setX2XKey($uuid,$resID,$callid) {
+	global $memcache, $expire;
+	$memcache->set("recorder:x2xuuid:$callid",$uuid,0,$expire);
+	$memcache->set("recorder:x2xresid:$callid",$resID,0,$expire);
+}
+
+function setMetaInfo($callid,$rtpproxyID,$dnis,$ani) {
+	global $memcache, $expire;
+	doLog("DEBUG","setMetaInfo $callid,$rtpproxyID", $dnis,$ani);
+        $metaInfo = array();
+        #$metaInfo['Start'] = date('Y-m-d H:i:s.000');
+        $metaInfo['rtpproxyID']=$rtpproxyID;
+        $metaInfo['Call-ID']=$callid;
+        $memcache->set("recorder:metainfo:$callid",$metaInfo,0,$expire);
+	if ( $dnis !== "" ) {
+		$memcache->set("recorder:dnis:$callid",$dnis,0,$expire);
+	}
+	if ( $ani !== "" ) {
+		$memcache->set("recorder:ani:$callid",$ani,0,$expire);
+	}
+	doLog("DEBUG","setMetaInfo: callid: $callid - rtpproxyID: $rtpproxyID ani: $ani dnis: $dnis"); 
+}
+
+function getUUIDByResID($resID) {	
+	global $memcache;
+	return $memcache->get("recorder:currentuuid:$resID");
+}
+function getMetaInfo($callid) {
+	global $memcache;
+	$metainfo = $memcache->get("recorder:metainfo:$callid");
+	doLog("DEBUG","getMetaInfo $callid: " . print_r($metainfo,true));
+	return $metainfo;
+}
+
+function updateMetaInfo($callid,$metainfo) {
+	global $memcache,$expire;
+	if (!$callid) {
+		doLog("ERROR","updateMetaInfo: callid is empy for $metainfo");
+		return;		
+	}
+
+	$memcache->set("recorder:metainfo:$callid",$metainfo,0,$expire);
+}
+
+function onTest() {
+	global $config;
+        $payload=file_get_contents('php://input');
+        doLog("DEBUG","Received payload:\n$payload");	
+
+	$lines=split("\r\n",$payload);
+	#doLog("DEBUG","Lines is " . print_r($lines,true));
+	#Variables declaration
+	$callid="";
+	$uuid="";
+	$dnis="";
+	$ani="";
+
+	foreach($lines as $l) {
+		if (preg_match("/^Call-ID: (.*)/",$l,$match)) {
+			$callid=$match[1];
+			doLog("DEBUG","onTest: callid is $callid");
+		} else if (preg_match("/^X-2X-CallUUID: (.*)/",$l,$match)) {
+			$uuid=$match[1];
+		} else if (preg_match("/^X-2X-DNIS: (.*)/",$l,$match)) {
+                        $dnis=$match[1];
+		} else if (preg_match("/^X-2X-ANI: (.*)/",$l,$match)) {
+                        $ani=$match[1];
+                }
+	}
+	
+	doLog("DEBUG","onTest: Found callid:$callid, uuid:$uuid, dnis:$dnis, ani:$ani");
+	$exist=getMetaInfo($callid);
+	doLog("DEBUG","onTest: metainfo for $callid is " . print_r($exist,true));	
+	if ($exist !== false) {
+		$rtpproxyID=$exist['rtpproxyID']; 
+		doLog("DEBUG","onTest: callid $callid is already rtpproxed on rtpproxyID:$rtpproxyID");
+		return $rtpproxyID;
+	}
+/*
+	$filter = @$config->recorderName;
+        if ($filter !== false && !strstr($payload,$filter)){
+                doLog("DEBUG","onTest: $filter not found in message");
+                return 0;
+        }
+*/	
+	setLinkUUID_CALLID($callid,$uuid);
+	setMetaInfo($callid,"127.0.0.1",$dnis,$ani);
+
+	$rtpproxyID=getRtpProxy($callid);
+
+#	doLog("DEBUG","onTest: $filter found in message - rtpproxed - use rtpproxyID: $rtpproxyID");
+	setMetaInfo($callid,$rtpproxyID,$dnis,$ani);
+	
+	return $rtpproxyID;
+}
+
+function getRtpProxy($callid) {
+	global $config,$memcache;
+	$count = count($config->rtpproxy);
+
+	$crc=abs(crc32($callid));
+	$rtpid=($crc % $count);
+	doLog("INFO","First $rtpid");
+	$maxloop=$count;
+	do {
+		$maxloop--;
+		$info=$memcache->get("recorder:rtpproxyinfo:$rtpid");
+		if (!$info) {
+			doLog("INFO","Not found in memcached recorder:rtpproxyinfo:$rtpid - Query rtpproxy");
+                        $info=getRtpProxyInfo($rtpid);	
+                        $memcache->set("recorder:rtpproxyinfo:$rtpid",$info,0,100); //Store for 10 sec.
+                }
+
+		if (!$info) {
+			doLog("WARNING","RTPPROXY with id $rtpid is not reachable");
+			$rtpid=($rtpid + 1) % $count;
+		}
+
+	} while(!$info && $maxloop >= 0 );
+
+	if (!$info) {
+		doLog("ERROR","Not found a RTPPROXY reachable");
+		return false;
+	}
+	
+        $hash=$rtpid + 1;
+	doLog("INFO","Found RTPPROXY with id $hash for call $callid");
+
+	return $hash;
+}
+
+function cleanup($callid) {
+	global $memcache;
+	$uuid=getUUID($callid);
+	doLog("DEBUG","Cleanup callid:$callid - uuid:$uuid");
+
+/*
+**	UUID keys
+*/ 
+	$s = getSegments($callid);
+	$resID=$s['resID'];
+	$varArr=split('@',$resID);
+	$extension=$varArr[0];
+	$slots=$s['slots'] || array();
+
+
+	foreach((array)$slots as $slot) {
+
+		$uuid=$slot['taguuid'];
+
+		$memcache->delete("recorder:tags:$uuid:$callid");
+		$memcache->delete("recorder:established:$uuid:$callid");
+		$memcache->delete("recorder:established:$uuid"); #Set by opensips
+		$memcache->delete("recorder:sipkey:$uuid:$extension");
+		$memcache->delete("recorder:callid:$uuid");
+        $memcache->delete("recorder:calldata:$uuid:$resID");
+	}
+
+/*
+** 	Callid keys
+*/	
+	$memcache->delete("recorder:uuid:$callid");
+	$memcache->delete("recorder:dnis:$callid");
+	$memcache->delete("recorder:ani:$callid");
+	$memcache->delete("recorder:metainfo:$callid");
+	$memcache->delete("recorder:segments:$callid");
+	$memcache->delete("recorder:x2xresid:$callid");
+	$memcache->delete("recorder:x2xuuid:$callid");
+
+/*
+**	resID keys	
+*/
+	#$memcache->delete("recorder:currentuuid:$resID");	//Do not delete currentuuid because it could be the one of a new call
+}
+
+function cleanupOnlyByUUID($uuid,$resID) {
+	global $memcache;
+	$varArr=split('@',$resID);
+	$extension=$varArr[0];
+
+	$memcache->delete("recorder:established:$uuid"); #Set by opensips
+	$memcache->delete("recorder:sipkey:$uuid:$extension");
+	$memcache->delete("recorder:callid:$uuid");
+	$memcache->delete("recorder:calldata:$uuid:$resID");
+	
+	/*
+	**	resID keys	
+	*/
+	#$memcache->delete("recorder:currentuuid:$resID");	//Do not delete currentuuid because it could be the one of a new call
+}
+
+function onConferenced($resID,$obj) {
+	global $memcache,$expire;
+	$uuid=$obj->call->uuid;
+	$memcache->set("recorder:currentuuid:$resID",$uuid,0,$expire);
+	doLog("DEBUG","onConferenced: set $resID with call $uuid");
+}
+
+function onHeld($resID,$obj){
+	global $memcache,$expire;
+        $uuid=$obj->call->uuid;
+	doLog("INFO","Received a [held] event on call uuid $uuid");
+	$callid=getCallID($uuid,$resID);
+    if ($callid) {
+        $active=isRecording($callid);
+        if ($active) {
+            stopRecordingTS($uuid,true,$callid);
+        }
+    }
+}
+
+function onRetrieved($resID,$obj){
+    global $memcache,$expire;
+    $uuid=$obj->call->uuid;
+	doLog("INFO","Received a [retrieved] event on call uuid $uuid");
+    $callid = getCallID($uuid,$resID);
+	$s=getSegments($callid);
+	$isDRR = isDuplicatedRecordingRunning($s);
+
+    if ($callid) {
+	    $active=isRecording($callid);
+	    if ($active) {
+		    startRecordingTS($resID,$uuid,true,false,false,$isDRR);
+	    }
+    }
+}
+
+function onEstablished($resID,$obj){
+	global $memcache,$expire,$config;
+	$uuid=$obj->call->uuid;
+	$call=$obj->call;
+	$switchID=$obj->call->switchID->id;
+	
+	
+	doLog("INFO","onEstablished: uuid:$uuid");
+
+        
+	if ($config->version !== "7") {
+		$callid=$obj->call->switchID->id;
+		doLog("INFO","Version is [$config->version]");
+       		$partySwitchID=$obj->partySwitchID->id;
+		$memcache->set("recorder:established:$uuid:$callid",$partySwitchID,0,$expire);
+	       	setLinkUUID_CALLID($callid,$uuid);
+	} else {
+		$callid=getCallID($uuid,$resID);
+		if (!$callid) {
+			doLog("ERROR", "Impossible to find callid for $uuid and $resID");
+			return;
+		}
+		setX2XKey($uuid,$resID,$callid);
+		doLog("INFO","onEstablished: callid is $callid for $uuid and $resID");
+	}
+ 
+	$calldataArr=fetchCallData($uuid,$resID);
+
+    $tags = getTags($uuid,$callid);
+	$tags=addCallDataTag($tags,$calldataArr,$config->calldatamap,$config->calldatamap_fallback,true);
+	setTags($uuid,$tags);
+	
+	#$tags=getTags($uuid,$callid);
+	$type=$call->type;
+
+	switch($type){
+		case 'inbound':
+			$switchCH = 'false';
+		break;
+		case 'Calltask':
+			if (@$call->dialerID) {
+				$switchCH = 'false';
+			}
+		break;
+		default:
+			$switchCH = 'true';
+	}
+
+	doLog("DEBUG","onEstablished: uuid:$uuid - callType:$type - callid: $callid");
+	if($type) {
+		$tags['CallType'] = $type;
+	}
+	$extension=$resID;
+	$memcache->set("recorder:currentuuid:$resID",$uuid,0,$expire);
+	$dnis=$obj->call->dnis;
+	$agent=getAgentFromExtension($extension);
+
+	$tags['X-REC_VUUID']=$uuid;
+	$tags['X-REC_EXTENSION']=$extension;
+	$tags['X-REC_AGENT']=$agent;
+	$tags['Organization']= $memcache->get("recorder:organization");
+	$tags['switchChannel'] = $switchCH;
+
+	$rtpproxyID=getRtpProxy($callid);
+	setMetaInfo($callid,$rtpproxyID,"","");
+
+	if (!@$tags['X-REC_REMOTE']) {
+		$remote=getRemote($call);
+		doLog("DEBUG","onEstablished: set X-REC_REMOTE to $remote");
+		$tags['X-REC_REMOTE']=$remote;
+	}
+	doLog("DEBUG","Tags: ". print_r($tags,true));
+	setTags($uuid,$tags,$callid);
+	$testRecording=testRecording($uuid,$resID,true,$callid); #WARNING: is it needed????
+	makeStartRecording($resID,$uuid,true,false,$callid);
+}
+
+function onConnectionCleared($resID,$obj) {
+	$uuid=$obj->call->uuid;	
+	doLog("INFO","onConnectionCleared: uuid:$uuid");
+	$callid=getCallID($uuid,$resID);
+	$s=getSegments($callid);
+	if ($s['resID'] != $resID ) {
+		doLog("INFO","Discarding event because resourceID is different $resID - " . $s['resID'] . print_r($s,true));
+		doLog("INFO", "Cleanup $callid - $uuid because there are not recordings for this call"); 
+		if ($callid) {
+			cleanup($callid);
+		} else {
+			cleanupOnlyByUUID($uuid,$resID);
+		}
+		return;
+	}
+	if ($s['activeUUID']) {
+		unset($s['activeUUID'][$uuid]);
+		doLog("DEBUG","onConnectionCleared: Removed $uuid from activeUUID");
+		setSegments($callid,$s);
+	}
+
+	if (isRecording($callid)) {	
+		stopRecordingTS($uuid,false,$callid);
+		removeRecording($callid,$uuid);
+	} else if (count(@$s['slots']) <= 0) {
+		doLog("INFO", "Cleanup $callid - $uuid because there are not recordings for this call"); 
+		if ($callid) {
+			cleanup($callid);
+		} else {
+			cleanupOnlyByUUID($uuid,$resID);
+		}
+	}
+}
+
+function onPartyChanged($resID,$obj) {
+	global $memcache,$expire,$config;
+	$call=$obj->call;
+	$otherCall=@$obj->otherCall;
+	if ($otherCall) {
+		onConsultationCall($resID,$obj);
+	} else {
+		onSingleStepTransfer($resID,$obj);
+	}
+	
+}
+
+function onSingleStepTransfer($resID,$obj) {
+    global $memcache,$expire,$config;
+    $call=$obj->call;
+    $uuid=$call->uuid;
+	$otherResID = $obj->otherID->device . "@" . $obj->otherID->domain;
+    $callid=getCallID($uuid,$resID);
+	$otherCallID=getCallID($uuid,$otherResID);
+	
+    #Copy calldata from original call
+    $calldataArr = fetchCallData($uuid,$otherResID);
+    if ($calldataArr) {
+        storeCallData($calldataArr,$uuid,$resID);
+    }
+	#$tags=getTags($uuid,$otherCallID);
+	#setTags($uuid,$tags,$callid);
+
+	return;	
+
+}
+
+function onConsultationCall($resID,$obj) {
+	
+        global $memcache,$expire,$config;
+        $call=$obj->call;
+        $otherCall=$obj->otherCall;
+        $primaryUUID=$otherCall->uuid;
+        $uuid=$primaryUUID;
+        $consultationUUID=$call->uuid;
+        #Get callid from consultationUUID because it is the same
+        $callid=getCallID($consultationUUID,$resID);
+
+        doLog("INFO","onPartyChanged: CONSULTATION_CALL primary uuid:$primaryUUID - consultation uuid:$consultationUUID - callid:$callid");
+
+
+
+
+        stopRecordingTS($consultationUUID,false,$callid);
+        doLog("INFO","onPartyChanged: consultationUUID($consultationUUID) -> $callid");
+
+        $tags=getTags($consultationUUID,$callid);
+        $type=$otherCall->type;
+        $extension=$resID;
+        $memcache->set("recorder:currentuuid:$resID",$primaryUUID,0,$expire);
+        $agent=getAgentFromExtension($extension);
+
+        $tags['CallType']=$type;
+        $tags['X-REC_VUUID']=$primaryUUID;
+        $tags['X-REC_EXTENSION']=$extension;
+        $tags['X-REC_AGENT']=$agent;
+        $tags['Organization']= $memcache->get("recorder:organization");
+        $tags['X-REC_REMOTE']=getRemote($otherCall);
+
+        $rtpproxyID=getRtpProxy($callid);
+        setMetaInfo($callid,$rtpproxyID,"","");
+
+        doLog("DEBUG","Tags: ". print_r($tags,true));
+        setTags($primaryUUID,$tags,$callid); #use $consultationUUID because it has to update original tags
+        $testRecording=testRecording($consultationUUID,$resID,true,$callid); #WARNING: is it needed????
+        makeStartRecording($resID,$consultationUUID,true,$primaryUUID); #use $consultationUUID because it has to update original tags
+
+        doLog("DEBUG","onPartyChanged: set link $primaryUUID -> $callid");
+        setLinkUUID_CALLID($callid,$primaryUUID);
+
+}
+
+function getOrganizationFromAgent($agent) {
+	global $config;
+	if (isset($config->organization)){
+		$org=$config->organization;
+	} else {
+		$org=false;
+		$pos=strpos($agent,".");
+		if ($pos) {
+			$org=substr($agent,$pos+1);
+		}
+	}
+	return $org;
+}
+
+function sipEstablished($callid,$fromtag,$totag,$uuid){
+	global $memcache,$expire;
+	doLog("INFO","sipEstablished: $callid,$fromtag,$totag,$uuid");
+	$partySwitchID="$callid;to-tag=$totag;from-tag=$fromtag";
+	if (!$uuid) {
+		doLog("DEBUG","Not found UUID, get from mem linked to callid: $callid");
+		$uuid=getUUID($callid);
+	}
+	
+	setLinkUUID_CALLID($callid,$uuid);
+
+	if (!$uuid) {
+		doLog("ERROR","Not found UUID linked to callid: $callid");
+		return;
+	}
+
+	$memcache->set("recorder:established:$uuid:$callid",$partySwitchID,0,$expire);
+	doLog("INFO","sipEstablished: Set partySwitchId from SIP $partySwitchID");
+}
+
+function hasBeenEstablished($uuid,$callid,$resID = false){
+	global $memcache,$expire;
+	if ($resID) {
+		$s = getSipKey($uuid,$resID);
+		if ($s) {
+			return $s['sipkey'];
+		}
+	}
+
+	$ret=$memcache->get("recorder:established:$uuid:$callid");
+	if (!$ret) {
+		$ret = $memcache->get("recorder:established:$uuid");
+		if ($ret) {
+			$memcache->set("recorder:established:$uuid:$callid",$ret,0,$expire);
+			$memcache->delete("recorder:established:$uuid");
+		}
+	}
+	doLog("DEBUG","hasBeenEstablished: $uuid  - $callid - returned [$ret]");
+	return $ret;
+}
+
+function lockMemCache() {
+	global $memcache;
+	doLog("DEBUG","Asking for the lock");
+	do {
+		$ret=$memcache->add("recorder:lock",true,0,2); //2sec max
+		if ($ret === false) {
+			doLog("WARNING","MEMCACHED is locked");
+			 usleep(100000); //Wait 0.1s before retry
+		}
+	
+	} while (!$ret ); 
+	doLog("DEBUG","Got lock");
+	return true;
+}
+
+function unlockMemCache() {
+	global $memcache;
+	$memcache->delete("recorder:lock");
+	doLog("DEBUG","Lock released");
+}
+
+function removeOldRecordings(&$list,$olderThan /* num of seconds from the entry*/) {
+	$now=time();
+	if (!$list || !is_array($list)){
+		return;
+	}
+
+	foreach($list as $c => $ts ) {
+		if ( $ts < ($now - $olderThan) ) {
+			doLog("WARNING","Remove recordings with callid $c");
+			unset($list[$c]);
+		}
+	}
+}
+
+function getActiveRecordingList() {
+	global $memcache;
+	$list = $memcache->get("recorder:activerecordings:list");
+	if ($list === false) {
+		$list = array();
+	}
+	return $list;
+}
+
+function setActiveRecordingList($list) {
+	global $memcache,$expire;
+	$memcache->set("recorder:activerecordings:list",$list,0,$expire); //2 hours
+}
+
+function insertRecording($key) {
+	doLog("DEBUG","insertRecording: $key");
+	lockMemCache();
+	$list=getActiveRecordingList();
+	$list[$key]=time();
+	setActiveRecordingList($list);
+	#doLog("DEBUG","insertRecording: found " . print_r($list,true));
+	unlockMemCache();
+	countRecordings($list);
+}
+
+function removeRecording($key,$uuid) {
+	global $expire;
+	doLog("DEBUG","removeRecording: $key - $uuid");
+	$s = getSegments($key);
+	$activeUUID = $s['activeUUID'];
+	if ($activeUUID && count($activeUUID)>0) {
+		doLog("INFO","removeRecording: Do not remove recording $key,$uuid because activeUUID is: " . print_r($activeUUID,true));
+		return;
+	}
+
+	lockMemCache();
+	$list=getActiveRecordingList();
+	unset($list[$key]);
+	removeOldRecordings($list,$expire); //Remove recordings older than 4 hours
+	setActiveRecordingList($list);
+	unlockMemCache();
+	countRecordings($list);
+}
+
+function isRecording($key) {
+	if (!$key ) {
+		doLog("ERROR","isRecording: key is null");
+		return false;
+	}
+
+	# Do not lock because is read-only
+	$list=getActiveRecordingList();
+	$active=array_key_exists($key,$list);
+	doLog("DEBUG","isRecording: $key - [$active]");
+	return $active;
+	
+}
+
+function countRecordings($list=false) {
+	if ($list === false) {
+		$list=getActiveRecordingList();
+	}
+
+	if ($list === false) {
+		$c=0;
+	} else {
+		$c=count($list);
+	}
+
+	doLog("INFO", "Active recordings are: $c");
+	$result['result']=true;
+	$result['count']=$c;
+	return $result;
+}
+
+function sipEndCall($callid) {
+	$uuid=getUUID($callid);
+	doLog("INFO","sipEndCall: $callid - $uuid");
+	if (isRecording($uuid)) {
+		stopRecordingTS($uuid);
+	}
+}
+
+
+function onAgentAttached($resourceID,$obj) {
+	global $memcache,$expire;
+	$agentID=$obj->agentID->device;
+	$domain=$obj->agentID->domain;
+	$organization=getOrganizationFromAgent($domain);
+	doLog("DEBUG","onAgentAttached: resId=$resourceID - agentID=$agentID");
+	$memcache->set("recorder:agentAttached:$resourceID",$agentID,0,$expire*24);
+	$memcache->set("recorder:organization",$organization,0,$expire*24);
+}
+
+function onAgentDetached($resourceID,$obj) {
+	global $memcache,$expire;
+	$agentID=$obj->agentID->device;
+	doLog("DEBUG","onAgentDetached: resId=$resourceID - agentID=$agentID");
+	$memcache->delete("recorder:agentAttached:$resourceID");
+}
+
+function getAgentFromExtension($ext) {
+	global $memcache;
+	return $memcache->get("recorder:agentAttached:$ext");
+}
+
+function onJobScheduled($resourceID,$obj) {
+	global $config,$memcache,$expire;
+
+	$agentID=$resourceID;
+	$agentIDArr=explode("@",$agentID);
+	$agentID=$agentIDArr[0];
+	$extension=$obj->mediaID->device;
+	$call=$obj->job->call;
+	$uuid=$call->uuid;
+	$type=$call->type;
+	$ani="";
+	if (isset($call->ani)) {
+		$ani=$call->ani;
+	}
+	$dnis="";
+	if (isset($call->dnis)) {
+		$dnis=$call->dnis;
+	}
+	$calldataSeq=@$obj->job->data->Sequence;
+
+	$calldataArr=extractCallDataArr($calldataSeq);
+    $resID = $obj->mediaID->device . "@" . $obj->mediaID->domain;
+	storeCallData($calldataArr,$uuid,$resID);
+	$tags = array();
+	$tags['CallType']=$type;
+	$tags['X-REC_VUUID']=$uuid;
+	$tags['X-REC_AGENT']=$agentID;
+	$tags['X-REC_REMOTE']=getRemote($call);
+	$tags['X-REC_EXTENSION']=$extension;
+	$tags['Organization']= $memcache->get("recorder:organization");
+	
+	$tags=addCallDataTag($tags,$calldataArr,$config->calldatamap,$config->calldatamap_fallback);
+
+	doLog("INFO","onJobScheduled: uuid:$uuid - tags: ". print_r($tags,true));
+
+	setTags($uuid,$tags);
+}
+
+function storeCallData($calldataArr,$uuid, $resID) {
+	global $memcache,$expire;
+	doLog("DEBUG","storeCallData: $uuid and calldata: " . print_r($calldataArr,true));
+	$previousCalldataArr=fetchCallData($uuid,$resID);
+	if (!is_array($previousCalldataArr)) {
+			$previousCalldataArr = array();
+	}
+	$newCallDataArr=array_merge($previousCalldataArr,$calldataArr);
+	$memcache->set("recorder:calldata:$uuid:$resID",$newCallDataArr,0,$expire);
+}
+
+function fetchCallData($uuid, $resID) {
+	global $memcache;
+	$retArr = $memcache->get("recorder:calldata:$uuid:$resID");
+	doLog("DEBUG","fetchCallData: $uuid and calldata: " . print_r($retArr,true));
+	return $retArr;
+}
+
+function onDataChanged($resID,$obj,$eventModelID){
+	global $memcache,$expire,$config;
+	doLog("DEBUG","onDataChanged: " . print_r($obj,true));
+
+	if ($eventModelID === "1.2.8") { // CallDataEventModel
+		$uuid=$obj->call->uuid;
+		$calldata=$obj->data;
+		$callid=getCallID($uuid,$resID);
+		doLog("DEBUG","Received calldata:" . print_r($calldata,true));
+		$calldataArr=extractCallDataArr($calldata->Sequence);
+		doLog("INFO","onDataChanged: uuid[$uuid]: " . print_r($calldataArr,true));
+
+		storeCallData($calldataArr,$uuid,$resID);
+		$tags=getTags($uuid,$callid);
+		$tags=addCallDataTag($tags,$calldataArr,$config->calldatamap,$config->calldatamap_fallback,true);
+		setTags($uuid,$tags);
+
+	} else { //ResourceDataEventModel
+		$uuid=$memcache->get("recorder:currentuuid:$resID");
+		if ($uuid === false){
+			doLog("INFO","onDataChanged: Not found the current call for $resID");
+			return;
+		} else {
+			doLog("INFO","onDataChanged: current call for $resID is $uuid");
+		}
+		$seq=false;
+		if (isset($obj->data) && isset($obj->data->Sequence)) {	
+			$seq=$obj->data->Sequence;
+		}
+
+		if (isset($seq->name) && $seq->name  === "ManRecordingStatus") {
+			$value = asciiToTxt($seq->value);
+			doLog("DEBUG","onDataChanged: ManRecordingStatus received $value");
+			onRecordingEvent($resID,$uuid,$value);
+		}
+	}
+}
+
+function onRecordingEvent($resID,$uuid, $value) {
+	doLog("INFO","onRecordingEvent - received [$value] for $uuid");
+	switch($value) {
+	case "on air\0":
+		makeStartRecording($resID,$uuid,false);
+	break;
+	case "in progress\0":
+	break;
+	case "idle\0":
+		makeStopRecording($uuid,$resID,false);
+	break;
+	case "on failed\0":
+		makeStopRecording($uuid,$resID,false);
+	break;
+	default:
+		doLog("DEBUG","Event $value not handled");
+	}
+}
+
+function getRecordingFilter() {
+	global $config;
+
+        $obj= new stdClass();
+        $obj->filter = "";
+        $obj->rate = 1.0;
+        $filterArr=array( $obj );
+
+        $filterArr=@$config->recorderX2XFilter;
+	if (is_null($filterArr)) {
+		//Without param, recordEverything
+		$obj->filter="";	
+		$filterArr=array( $obj );
+
+	} else 	if (is_string($filterArr)) {
+		$obj->filter=$filterArr;	
+		$filterArr=array( $obj );
+
+	} else if (is_object($filterArr)) {
+
+		$filterArr=array($filterArr);
+	
+	}
+
+    //doLog("DEBUG","filterArr is " . print_r($filterArr,true));
+
+	return $filterArr;
+}
+
+function getTags($uuid,$callid=false,$slotId = false, $duplicated  = false ) {
+	global $memcache;
+	if ($callid == false) {
+		$callid = getCallID($uuid);
+	}
+	if ($slotId !== false) {
+		doLog("DEBUG","getTags $uuid - $callid - slotID: [$slotId] - duplicated: [$duplicated]");
+		$s=getSegments($callid);
+		$tags=@$s[getStrSlot($duplicated)][$slotId]['tags'];
+		if ($tags === false) {
+			doLog("WARNING","Impossibile to find tags for $callid and slot $slotId. Use default tags");
+		} else {
+			return $tags;	
+		}
+	}
+	doLog("DEBUG","getTags $uuid - $callid - slotID: [$slotId] - duplicated: [$duplicated] - Use Default tags");
+		
+	return $memcache->get("recorder:tags:$uuid:$callid");
+}
+
+function setTags($uuid,$tags,$callid = false) {
+	global $memcache,$expire;
+	if ($callid === false) {
+		$callid=getCallID($uuid);
+	}
+	doLog("INFO","Set tags to $uuid - $callid");
+	if (!$callid || !$uuid) {
+		doLog("ERROR","Impossible to set tag $callid - $uuid");
+		return;
+	}
+	$memcache->set("recorder:tags:$uuid:$callid",$tags,0,$expire);
+}
+
+function testRecording($uuid,$resID,$autoRec = false,$callid=false) {
+	global $config;
+    doLog("DEBUG","testRecording: uuid[$uuid],resID[$resID],autoRec[$autoRec],callid[$callid]");
+    if ($callid === false) {
+	    $callid=getCallID($uuid,$resID);
+    }
+    $cd=fetchCallData($uuid,$resID);
+    if (!$cd || count($cd) === 0) {
+	    doLog("ERROR","Not found tags for $uuid and $resID");
+	    $cd = array("_empty_" => "_empty_");
+    }
+    doLog("DEBUG","testRecording: found $uuid calldata " . print_r($cd,true));
+    $found=false;
+    $filterArr=getRecordingFilter();
+
+    $rate=1.0;
+
+    foreach($filterArr as $filterObj) {
+        doLog("DEBUG","testRecording: check filter rule:" . print_r($filterObj,true));
+		$filter = $filterObj->filter;
+		$filterAutoCfg = @$filterObj->auto ;
+
+		$testAutoProperty = !($autoRec xor $filterAutoCfg ); //True if autoRec and filterAutoCFG are both TRUE or both FALSE
+
+        if (!$testAutoProperty ) {
+            doLog("DEBUG","testRecording: rule does not match recording auto = $autoRec");
+			continue;
+		}
+		
+		$duplicate = false;
+        //Check if it is needed to duplicate recording
+        if (!$autoRec && isRecording($callid) && @$filterObj->duplicate) {
+            $testAuto = false;
+            $duplicate = true;
+            doLog("DEBUG","testRecording: set duplicate flag to true");
+        }
+
+
+	    foreach($cd as $k=>$v){
+	            if (preg_match("/$filter/" , $v)  ) {
+	                doLog("DEBUG","testRecording: recording because $v matches $filter");
+	                $found=true;
+	                if (isset($filterObj->rate)){
+	                    $rate=$filterObj->rate;
+						$extraTags=(array)(@$filterObj->extratags);
+						doLog("DEBUG","testRecording: $uuid - use rate: [$rate]");
+	                }
+	            	break;
+	          	}
+	    }
+
+        if ($found) {
+	            break;
+	    }
+    }
+
+    if (!$found) {
+            doLog("DEBUG", "testRecording: $uuid not recording because it does not match any filters");
+            return false;
+    }
+
+    if ($rate < 1.0) {
+            $max_range=10000;
+            $randInt=rand(0,$max_range -1 );
+            if ($randInt > ($rate * $max_range)) {
+                    doLog("DEBUG","testRecording: $uuid not recording because rate is [$rate] - rnd[" . ($randInt/$max_range) . "]");
+                    return false;
+            }
+    }
+
+/*
+    $tags=getTags($uuid,$callid);
+	if ($extraTags) {	
+		doLog("DEBUG","Add extra tags: " . print_r($extraTags,true));
+		$tags=array_merge($tags,$extraTags);	
+		setTags($uuid,$tags);
+	}
+*/
+	return array( "test" => true, "duplicate" => $duplicate, "extraTags" => $extraTags) ;
+	
+}
+
+function testMaxChannels() {
+	global $config;
+	$maxchannels = $config->maxchannels;
+    if (@$maxchannels > 0) {
+		$c = countRecordings();
+		$c = $c['count'];
+		if ($c >= $maxchannels) {
+			doLog("WARNING", "Max channels limit reached!! Active:$c - Max:$maxchannels");
+			syslog(LOG_WARNING, basename(__FILE__,".php") . ": Max channels limit reached!! Active:$c - Max:$maxchannels" );
+			return false;
+		}
+		doLog("INFO", "Recording channels: Active:$c - Max:$maxchannels");
+		//syslog(LOG_INFO, basename(__FILE__,".php")  . ": Recording channels: Active:$c - Max:$maxchannels");
+	}
+	return true;
+}
+
+function makeStartRecording($resID,$uuid,$auto=false,$taguuid=false,$callid = false, $duplicate=false) {
+	global $config;
+    $recStarted = false;
+
+	if ($callid === false ) {
+		$callid=getCallID($uuid,$resID);
+	}
+	$sipkey=getSipKey($uuid,$resID);
+	$partySwitchID=$sipkey['sipkey'];
+	doLog("INFO","makeStartRecording: $resID - uuid:$uuid - callid:$callid - auto:[$auto]");
+
+	
+
+
+	#recorderX2XFilter
+	$startRecording=testRecording($uuid,$resID,$auto,$callid);
+	if ($startRecording === false) {
+		return;
+	}
+
+    if (!$startRecording['duplicate']) {
+        #Test if a automatic recordings is already active
+        $metainfo=getMetaInfo($callid);
+
+        if (@$metainfo['auto']){
+            doLog("INFO","makeStartRecording: Already started a recording for $callid - $uuid");
+            return;	
+        }
+
+        #Test is the last slot is still opened (on air event duplicated)
+        $segments=getSegmentsByUUID($uuid);
+        $lastSlot = getLastElement($segments[getStrSlot(false)]);
+
+        if ($lastSlot['start'] && !@$lastSlot['stop']) {
+            doLog("INFO","makeStartRecording: Already started a recording for $callid - $uuid with obj " . print_r($lastSlot,true));
+            return;	
+        }
+    
+
+
+        #ca0beaaf-a19d-e511-971a-005056b70002@10.77.38.162;to-tag=w3pshop;from-tag=35cpbvh
+        
+        $t = preg_match("/(.*);to-tag=(.*);from-tag=(.*)/",$partySwitchID,$match);
+        if (!$t) {
+            doLog("ERROR","makeStartRecording: preg_match ret $t - partySwitchID is not valid: [$partySwitchID] - with uuid [$uuid]");
+            return;
+        }
+        $callid=$match[1];
+        $from_tag=$match[2];
+        $to_tag=$match[3];
+
+        $metainfo['auto']=$auto;	
+
+        updateMetaInfo($callid,$metainfo);
+
+        doLog("DEBUG","makeStartRecording: elems are $callid,$from_tag,$to_tag");
+        $recStarted=false;
+
+		if (!testMaxChannels()) {
+			return false;
+		}
+
+        foreach($config->rtpproxy as $r) {
+            doLog("DEBUG","Trying to start recording with $r");
+            $res=sendUDPMessage("0 RS $callid $from_tag;1 $to_tag;1",$r);
+            if (strpos($res, "0 0") === 0 ) {
+                sendUDPMessage("0 RS $callid $to_tag;1 $from_tag;1",$r);
+                doLog("NOTICE","Succesful started recoding $uuid - $callid,$from_tag,$to_tag - on $r");
+                $recStarted=true;
+                break;
+            }
+            doLog("DEBUG","Response not valid, try next recorder");
+        }
+
+        if (!$recStarted) {
+            doLog("ERROR","makeStartRecording: failed to start recording $uuid - $callid,$from_tag,$to_tag - on $r");
+            return;
+        }
+
+    } else {
+        doLog("INFO","Start a duplicated recording");
+    }
+
+	startRecordingTS($resID,$uuid,false,$taguuid,$auto, $startRecording['duplicate'], @$startRecording['extraTags']);
+	
+}
+
+function getRtpProxyInfo($rtpproxyID) {
+	global $config;
+	$uri=$config->rtpproxy[$rtpproxyID ];
+	doLog("DEBUG","getRtpProxyInfo: get info of $rtpproxyID with uri $uri");	
+	$res=sendUDPMessage("TOKEN_0 IL",$uri);
+	if (!$res) {
+		return false;
+	}
+	doLog("INFO","RTPPROXY INFO with $rtpproxyID: $res");
+	$res=str_replace("TOKEN_0 ", '', $res);
+	$info_matrix;
+
+	$lines=split("\n",$res);
+	foreach($lines as $l) {
+		$info=split(":",$l);
+		$info_key=str_replace(' ', '_', $info[0]);
+		$info_value=@$info[1];
+		$info_matrix[$info_key]=$info_value;
+	}
+	doLog("DEBUG","INFO:\n" . print_r($info_matrix,true));
+	return $info_matrix;
+}
+
+function getDuplicatedSlots($segments) {
+    if ($segments) {
+        return @$segments[getStrSlot(true)];
+    }
+    return null;
+}
+
+function isDuplicatedRecordingRunning($segments) {
+    #Check which and whether recording mode stop
+    $lastDuplicatedSlot = getLastElement(getDuplicatedSlots($segments));
+    if ($lastDuplicatedSlot) {
+        doLog("DEBUG","isDuplicatedRecordingRunning: lastDuplicatedSlot is " . print_r($lastDuplicatedSlot,true) );
+        return (!@$lastDuplicatedSlot['stop'] || @$lastDuplicatedSlot['reason'] === 'held' ); # A not closed slot (or a closed slot for hold) identifies a running recording!
+    };
+}
+
+function makeStopRecording($uuid,$resID,$auto) {
+	$callid=getCallID($uuid);
+	$metainfo=getMetaInfo($callid);
+    $segments=getSegments($callid);
+    doLog("DEBUG","makeStopRecording: metainfo for callid$callid: " . print_r($metainfo,true));
+
+    if (!$auto && isDuplicatedRecordingRunning($segments)) {
+		doLog("INFO","makeStopRecording: a duplicated recording is running");
+		stopRecordingTS($uuid,false,getCallID($uuid,$resID),true);
+	} else {
+		if (@$metainfo['auto']) {
+			doLog("INFO","makeStopRecording: $uuid - $callid - do not stop automatic recording");
+		} else {
+			stopRecordingTS($uuid,false,getCallID($uuid,$resID),false);
+		}
+	}
+}
+
+function isAuto($callid) {
+	$metainfo=getMetaInfo($callid);
+	return $metainfo['auto'];
+}
+
+function sendUDPMessage($msg,$uri) {
+	$fp = stream_socket_client("udp://$uri", $errno, $errstr, 2 ); //2 sec of connection timeout
+	if (!$fp) {
+ 		doLog("DEBUG","ERROR: $errno - $errstr");
+		return false;
+	} else {
+		fwrite($fp, "$msg\n");
+		$buff=fread($fp,1000);
+		doLog("DEBUG","Received response: [$buff]");
+		fclose($fp);
+	}
+	doLog("DEBUG","sendUDPMessage - finished");
+	return $buff;
+}
+
+
+function onEvent($resID,$data,$eventModelID) {
+	foreach($data as $event => $eventObj) {
+		switch($event) {
+		case "jobScheduled":
+			onJobScheduled($resID,$eventObj);
+		break;
+		case "established":
+			onEstablished($resID,$eventObj);
+		break;
+		case "connectionCleared":
+			onConnectionCleared($resID,$eventObj);
+		break;
+		case "partyChanged":
+			onPartyChanged($resID,$eventObj);
+		break;
+		case "agentAttached":
+			onAgentAttached($resID,$eventObj);
+		break;
+		case "agentDetached":
+			OnAgentDetached($resID,$eventObj);
+		break;
+		case "dataChanged":
+			onDataChanged($resID,$eventObj,$eventModelID);
+		break;
+		case "conferenced":
+			onConferenced($resID,$eventObj);
+		break;
+		case "held":
+			onHeld($resID,$eventObj);
+		break;
+		case "retrieved":
+			onRetrieved($resID,$eventObj);
+		break;
+			
+		}
+	}
+}
+
+function startRecordingTS($resID,$uuid,$join=false,$taguuid=false,$auto=false, $duplicate = false, $extraTags = false) {
+	doLog("INFO","startRecordingTS: $resID - $uuid - join:[$join] - taguuid:[$taguuid]");
+	if ($taguuid === false) {
+		$taguuid=$uuid;
+	}
+	$callid = getCallID($uuid,$resID);
+	$segments=getSegments($callid);
+	if ($segments === false) {
+		$segments = array();
+		$segments['startTS']=round(microtime(true),1);
+		$segments['resID']=$resID;
+		$segments['callid']=$callid;
+		$segments[getStrSlot(false)]=array();
+        $segments[getStrSlot(true)]=array();
+	}
+
+	if (@$segments['activeUUID']) {
+		$segments['activeUUID'][$uuid] = true;
+	} else {
+		$segments['activeUUID'] = array($uuid => true)	;
+	}
+
+    $lastSlot = getLastElement($segments[getStrSlot(false)]);
+	$lastDuplicatedSlot = getLastElement($segments[getStrSlot(true)]);
+    
+
+	$diff=abs(round(microtime(true) - $segments['startTS'],1));
+	$newSlot['join']=$join;
+	$newSlot['start']=$diff;	
+	$newSlot['taguuid']=$taguuid;
+	if (is_array($extraTags)) {
+		$newSlot['tags']=$extraTags;
+	} else if ($join && @$lastSlot['tags']) {
+		$newSlot['tags'] = $lastSlot['tags'];
+	}
+
+	if (!$join) {
+		$newSlot['tags']['auto'] = $auto; # Only real new StartRecording has the auto flag set
+	}
+    
+	if(!@$lastSlot['stop']  && $duplicate) {
+        //Recording is already running and it needs to be duplicated
+		doLog("DEBUG", "Add new slot only to duplicated_slots");
+        array_push($segments[getStrSlot(true)],$newSlot);
+    } else if (@$lastSlot['reason'] === 'held' && $duplicate) {
+		doLog("DEBUG", "Add new slot both to duplicated_slots and slots");
+		$newDuplicateSlot = $newSlot;
+		$newDuplicateSlot['tags'] =  $lastDuplicatedSlot['tags'];
+		$newDuplicateSlot['tags']['auto'] = false;
+		$newSlot['tags']['auto'] = true;
+
+        array_push($segments[getStrSlot(false)],$newSlot);
+		array_push($segments[getStrSlot(true)],$newDuplicateSlot);
+    } else {
+		doLog("DEBUG", "Add new slot only to slots");
+		array_push($segments[getStrSlot(false)],$newSlot);
+	}
+	
+    setSegments($callid,$segments);
+	doLog("DEBUG","startRecording: " . print_r($segments,true));
+	
+    if (!$join) {
+		insertRecording($callid);
+	}
+}
+
+function getSegmentsByUUID($uuid,$callid = false) {
+	global $memcache;
+	if ($callid === false) {
+		$callid = getCallID($uuid);
+	}
+	return getSegments($callid);
+}
+
+function getSegments($callid) {
+	global $segmentsCached,$memcache;
+	doLog("DEBUG","Get segments from $callid");
+	$s = @$segmentsCached[$callid];
+	if (!$s) {
+		$s = $memcache->get("recorder:segments:$callid");
+		$segmentsCached[$callid] = $s; #update local cache
+	} else {
+		doLog("DEBUG", "getSegments from local cache!");
+	}
+	return $s;
+}
+
+function setSegments($callid,$segments) {
+	global $memcache,$expire,$segmentsCached;
+	doLog("DEBUG","Set segments from $callid");
+	$memcache->set("recorder:segments:$callid",$segments,0,$expire);
+	$segmentsCached[$callid] = $segments; #use local cache
+}
+
+
+function stopRecordingTS($uuid,$held = false,$callid = false, $duplicated = false) {
+	doLog("INFO","stopRecordingTS: $uuid - held[$held] - $callid");
+	
+
+	if ($callid === false) {
+		$callid=getCallID($uuid);
+	}
+
+	$segments = getSegments($callid); 
+	if ($segments === false) {
+		doLog("WARNING","stopRecordingTS: WARNING - Received a stopRecording without a startRecording");
+		return;
+	}
+	if (!$held) {
+		unset($segments['activeUUID'][$uuid]);
+		doLog("DEBUG","stopRecordingTS: removed $uuid from activeUUID. Now it is: " . print_r($segments['activeUUID'],true));
+	}
+
+	$slotStrArr = array(getStrSlot(false)); //Array of strings
+	if ($duplicated) {
+		#on demand recording
+		$slotStrArr = array(getStrSlot(true)); #Only duplicated_slots
+	} else if (	isDuplicatedRecordingRunning($segments) ) {
+		#automatic recording and duplicated recording running
+		array_push($slotStrArr,getStrSlot(true));
+
+	}
+	
+	
+    $tags = getTags($uuid,$callid);	
+		
+	foreach($slotStrArr as $slotStr) {
+		$slot=array_pop($segments[$slotStr]);
+
+		if (array_key_exists('taguuid',$slot) && $slot['taguuid'] != $uuid) {
+			doLog("INFO","stopRecordingTS with $uuid different from last taguuid " . $slot['taguuid'] . " - Nothing to do");
+			return;
+		}
+
+		if (array_key_exists('stop',$slot)) {
+			if ($slot['reason'] === 'held') {
+				doLog("DEBUG","stopRecordingTS: Stopping a previously stopped recording for held reason " . print_r($segments,true));
+				unset($slot['reason']);
+			} else {
+				doLog("DEBUG","stopRecordingTS: Not recording, do not need to set stop ts - Segment is " . print_r($segments,true));
+				return;
+			}
+		} else {
+			$slot['stop'] = abs(round(microtime(true) - $segments['startTS'],1));
+			$slot['tags'] = array_merge($tags,@$slot['tags']);
+			if ($held) {
+				$slot['reason'] = 'held';
+			}
+		}
+
+		doLog("DEBUG","stopRecordingTS: stored in $slotStr for $uuid tags:\n" . print_r($slot['tags'],true));
+		array_push($segments[$slotStr],$slot);
+	}
+
+	setSegments($callid,$segments);
+	doLog("DEBUG","stopRecordingTS: " .  print_r($segments,true));	
+	if (!$held && !$duplicated) {	
+		if ($callid === false) {
+			$callid = getCallID($uuid,$resID);
+		}
+		removeRecording($callid,$uuid);
+	}
+}
+
+
+function getSlot($uuid) {
+	$segments=getSegmentsByUUID($uuid);
+	if (!isset($_GET['markSlot'])){
+		return;
+	}
+	$markSlot=$_GET['markSlot'];
+	$slot=$segmnents['slots'][$markSlot];
+	doLog("DEBUG","getSlot $uuid " . print_r($slot,true));
+
+	echo $slot['start'] . " " . $slot['stop'];
+}
+
+function getStrSlot($duplicated) {
+	return ($duplicated) ? 'duplicated_slots' : 'slots';
+}
+
+function getNumSlots($callid, $duplicated = false) {
+	$segm=getSegments($callid);
+	return count($segm[getStrSlot($duplicated)]);
+}
+function getSlotById($callid,$id,$duplicated) {
+	$segm=getSegments($callid);
+	$slot=$segm[getStrSlot($duplicated)][$id];
+	if (!isset($slot['stop'])) {
+		$slot['stop'] = -1;
+	}
+	$join="FALSE";
+	if ($slot['join']) {
+		$join="TRUE";
+	}
+
+	return $slot['start'] .  " " . $slot['stop'] . " " . $join;
+}
+
+
+function makeSegmentsTag($callid,$duplicated = false) {
+	$segments=getSegments($callid);
+	$output="";
+	$e=true;
+
+	foreach ( $segments[getStrSlot($duplicated)] as $e) {
+		if ($e) {
+			if (!isset($e['stop'])) {
+		         	$e['stop'] = -1;
+       			 }
+			$output .= $e['start']. "-" . $e['stop'] ." "; 
+		}
+	} 
+	return $output;
+}
+
+function markSlot($uuid, $value = true) {
+	doLog("INFO","markSlot: $uuid with value=$value");
+	$segments=getSegmentsByUUID($uuid);
+	$duplicated = true;
+	$slot = array_pop($segments[getStrSlot(true)]); #Get the last element from duplicated_slots or slots
+	if (!$slot) {
+		$slot = array_pop($segments[getStrSlot(false)]); #Use non duplicated slot only if duplicated slot does not exist
+		$duplicated = false;
+	}
+
+	$slot['marked'] = $value;
+	array_push($segments[getStrSlot($duplicated)],$slot);
+	
+	## 29-05-2017 Not used anymore
+	##segments['marked']=$lastID; #ID of the last index
+	
+	doLog("DEBUG","markSlot: $uuid with value=$value " . print_r($segments,true));
+	$callid = getCallID($uuid);
+	setSegments($callid,$segments);
+}
+
+function onSetConfig() {
+	global $config;
+	$body = file_get_contents('php://input');
+	$obj=json_decode($body);
+	doLog("INFO","New config " . print_r($obj,true));
+	$file = basename($_SERVER['PHP_SELF'],".php");
+        file_put_contents($file.".cfg",json_encode($obj));
+	getConfig(true);
+
+}
+
+function fixXML($str) {
+	$str = preg_replace ( '/<([^<>]+)\/>/' , '$1' , $str);
+	return $str;
+}
+
+/* BEGIN */
+$memcache = new Memcache;
+$memcache->connect('{{ connect_row.stdout.split('\'')[1] }}', 11211) or die ("Could not connect");
+$config=getConfig();
+doLog("INFO","=================================================================================================");
+
+if (isset($_GET['mode']) ) {
+	switch($_GET['mode']) {
+	case "setcallid": 
+		setLinkUUID_CALLID($_GET['callid'],$_GET['uuid']);
+	break;
+	case "maketagfile":
+		$ret = makeTagFile($_GET['callid'],@$_GET['duplicated']);
+		echo $ret;
+	break;
+	case "maketagfilebyid":
+		$ret = makeTagFileById($_GET['callid'],$_GET['id'],@$_GET['duplicated']);
+		echo $ret;
+	break;
+	case "setmetainfo":
+		$dnis="";
+		if (isset($_GET['dnis'])){
+			$dnis=$_GET['dnis'];
+		}
+		
+		setMetaInfo($_GET['callid'],$_GET['addr'],$dnis);
+	break;	
+	case "test":
+		$res = onTest();
+		echo $res;
+	break;
+	case "cleanup":
+		cleanup($_GET['callid']);
+	break;
+	case "startrecording":
+		startRecording($_GET['uuid']);
+	break;
+	case "stoprecording":
+		stopRecording($_GET['uuid']);
+	break;
+	case "getslot":
+		$uuid=getUUID($_GET['callid']);
+		getSlot($uuid);
+	break;
+	case "getnumslots":
+		$ret=getNumSlots($_GET['callid'],@$_GET['duplicated']);
+		echo "$ret\n";
+	break;
+	case "getslotbyid":
+		$ret=getSlotById($_GET['callid'],$_GET['id'],@$_GET['duplicated']);
+		echo "$ret\n";
+	break;
+	case "markslot":
+		$value=true;
+		if (isset($_GET['value'])) {
+			if ($_GET['value'] !== "true" ) {
+				$value = false;
+			}
+		}
+		markSlot($_GET['uuid'],$value);
+	break;
+	case "established":
+		sipEstablished($_GET['callid'],$_GET['fromtag'],$_GET['totag'],@$_GET['uuid']);
+	break;
+	case "end":
+		sipEndCall($_GET['callid']);
+	break;
+	case "count":
+		$count=countRecordings();
+		echo json_encode($count) . "\n";
+	break;
+	case "isauto":
+		$auto=isAuto($_GET['callid']);
+		echo $auto;
+	break;
+	case "getconfig":
+		$text=json_encode(getConfig());
+		if(isset($_GET['callback'])) {
+			header("Content-Type: application/javascript");
+			echo $_GET['callback'] . "($text);";
+			
+		} else {
+			echo $text;
+		}
+	break;
+	case "setconfig":
+		onSetConfig();
+	break;
+	default:
+		doLog("DEBUG","Mode: " . $_GET['mode'] ." not implemented");
+	}
+	exit;
+} else if ( isset($argc) && $argc > 1 ) {
+	switch ($argv[1] ) {
+	case 'setcallid': 
+		setLinkUUID_CALLID( $argv[2],$argv[3]);
+		break;
+	case 'setmetainfo':
+		setMetaInfo($argv[2],$argv[3],$argv[4]);
+		break;
+	case 'maketagfile':
+		makeTagFile($argv[2]);
+		break;
+	default:
+		echo "Command $argv[1] non implemented\n";
+	}
+	exit;
+} else {
+}
+
+
+$strEvent = file_get_contents('php://input');
+doLog("DEBUG","Received: $strEvent");
+
+$strEvent=fixXML($strEvent);
+#doLog("DEBUG","Modified: $strEvent");
+
+$objEvent=json_decode(json_encode(simplexml_load_string($strEvent)));
+doLog("DEBUG","Received: " . print_r($objEvent,true));
+$sequence=$objEvent->Sequence;
+$data=$sequence->data;
+$eventModelID=$sequence->eventModelID;
+onEvent($sequence->resourceID,$data,$eventModelID);
+
+?>

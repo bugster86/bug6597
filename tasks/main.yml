@@ -7,3 +7,41 @@
   shell: mysql --user=ansible_update --password=$(cat /home/password_insert) -e "insert into ansible.bugs values ( '{{bug}}','$USER','$(date +%d-%m-%Y_%H:%M:%S)','{{inventory_hostname}}');"
   delegate_to: localhost
   changed_when: false
+  
+- name: "Verifico la presenza del file {{ php_dest_6597 }}"
+  stat:
+    path: "{{ php_dest_6597 }}"
+  register: f1_6597
+  
+- block:
+  - name: "estraggo la riga di connect dal file {{ php_dest_6597 }}"
+    shell: "grep \"memcache->connect\" {{ php_dest_6597 }} | grep -v \"#\"  "
+    changed_when: false
+    check_mode: false
+    register: connect_row
+  
+  - name: Posiziono il nuovo file {{ php_dest_6597 }}
+    template: 
+        backup: true
+        src: files/stereo_recording.j2
+        dest: "{{ php_dest_6597 }}"
+        owner: apache
+        group: apache
+        mode: 0755
+    
+  when: f1_6597.stat.exists
+
+- name: "Verifico la presenza del file {{ sh_dest_6597 }}"
+  stat:
+   path: "{{ sh_dest_6597 }}"
+  register: f2_6597
+  
+- name: copio il nuovo file stereo_recording.sh
+  copy:
+     backup: true
+     src: files/extract_audio.sh
+     dest: "{{ sh_dest_6597 }}"
+     owner: reicom
+     group: contact
+     mode: 0775
+  when: f2_6597.stat.exists
