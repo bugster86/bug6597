@@ -1,0 +1,9 @@
+# tasks file for 6597
+- name: resoconto in file {{ logfile }}
+  shell: echo "Applicato il bug {{bug}} dall'utente $USER in data $(date +%d-%m-%Y_%H:%M:%S) sui server {{inventory_hostname}} " >> {{ logfile }}
+  delegate_to: localhost
+  changed_when: false
+- name: resoconto in database ansible
+  shell: mysql --user=ansible_update --password=$(cat /home/password_insert) -e "insert into ansible.bugs values ( '{{bug}}','$USER','$(date +%d-%m-%Y_%H:%M:%S)','{{inventory_hostname}}');"
+  delegate_to: localhost
+  changed_when: false
